@@ -191,16 +191,234 @@ function getSteps(q, subject) {
   }
 }
 
-async function askTutor(messages, q, unitLabel, subject, wrongAnswer, grade) {
-  const sys=`You are "Max", a warm encouraging tutor for a Grade ${grade} student.
-Subject: ${subject}. Unit: ${unitLabel}.
-Question: "${q.text}" Correct answer: "${q.answer}". Student said: "${wrongAnswer??"time ran out"}".
-Keep replies SHORT (2-4 sentences). Simple language. Encouraging emojis 🎉. Guide them, don't just give the answer. Use real-world kid examples.`;
-  const res=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1000,system:sys,messages})});
-  const d=await res.json();return d.content?.[0]?.text||"Hmm, ask me again! 🤔";
+// ─── LEVEL SYSTEM ─────────────────────────────────────────────────────────────
+// Each unit has 10 levels:
+//   1-5  = LVUSD grade curriculum (start of year → end of year)
+//   6-8  = Extended practice / harder problems (still grade level)
+//   9-10 = Next grade early content (beyond LVUSD)
+// difficulty() maps levelIdx (0-9) to a multiplier used in question generators
+
+function difficulty(levelIdx) {
+  // Returns {mult, label, tier}
+  if(levelIdx<=4) return {mult:1+levelIdx*0.4, label:["Start of Year","Early Fall","Mid Year","Late Winter","End of Year"][levelIdx], tier:"grade"};
+  if(levelIdx<=7) return {mult:3+((levelIdx-5)*0.8), label:["Challenge I","Challenge II","Challenge III","Advanced"][levelIdx-5], tier:"extended"};
+  return {mult:5+(levelIdx-8)*1.5, label:["Next Grade Intro","Next Grade"][levelIdx-8], tier:"beyond"};
 }
 
-// ─── UI COMPONENTS ────────────────────────────────────────────────────────────
+function buildLevels(baseLabels, nextGradeLabels) {
+  // baseLabels: 5 LVUSD labels; nextGradeLabels: 2 beyond labels
+  return [
+    ...baseLabels.map((label,i)=>({label,tier:"grade",mult:1+i*0.4})),
+    {label:"Challenge I",   tier:"extended", mult:3.0},
+    {label:"Challenge II",  tier:"extended", mult:3.8},
+    {label:"Challenge III", tier:"extended", mult:4.6},
+    {label:"Advanced",      tier:"extended", mult:5.2},
+    ...nextGradeLabels.map((label,i)=>({label,tier:"beyond",mult:6+i*1.5})),
+  ];
+}
+
+// ─── COINS ────────────────────────────────────────────────────────────────────
+// Coins earned per level completion:
+//   Score ≥ 90% → 50 coins + 20 bonus
+//   Score ≥ 75% → 35 coins
+//   Score ≥ 60% → 20 coins
+//   Below 60%   → 5 coins (participation)
+// Extended levels (6-8) give 1.5× coins; Beyond (9-10) give 2× coins
+
+function calcCoins(pct, tierOrLevelIdx) {
+  const tier = typeof tierOrLevelIdx === "string" ? tierOrLevelIdx : difficulty(tierOrLevelIdx).tier;
+  const mult = tier==="beyond"?2:tier==="extended"?1.5:1;
+  let base = pct>=90?70:pct>=75?35:pct>=60?20:5;
+  return Math.round(base*mult);
+}
+
+// ─── ELEVENLABS VOICE ─────────────────────────────────────────────────────────
+// Voice: "Daniel" — warm, authoritative, clearly a teacher/adult male
+// Voice ID: onwK4e9ZLuTAKqWW03F9 (Daniel — British educator, warm & clear)
+// Alternative high-school-teacher voices:
+//   "ErXwobaYiN019PkySvjV" = Antoni (warm American male, professional)
+//   "VR6AewLTigWG4xSOukaG" = Arnold (confident American male)
+//   "pNInz6obpgDQGcFmaJgB" = Adam   (deep, clear American male)
+//   "onwK4e9ZLuTAKqWW03F9" = Daniel (warm British educator — RECOMMENDED)
+const ELEVENLABS_API_KEY  = "";  // ← paste your key here
+const ELEVENLABS_VOICE_ID = "onwK4e9ZLuTAKqWW03F9"; // Daniel — warm educator
+const ELEVENLABS_MODEL    = "eleven_flash_v2_5";
+
+let _activeAudio = null;
+
+function stopSpeech() {
+  if(_activeAudio){_activeAudio.pause();_activeAudio.src="";_activeAudio=null;}
+  try{window.speechSynthesis?.cancel();}catch{}
+}
+
+function cleanForTTS(text){
+  return text.replace(/[\u{1F000}-\u{1FFFF}]/gu,"").replace(/[\u{2600}-\u{27BF}]/gu,"")
+    .replace(/[✅❌⭐🔊🔇■▶🎉💰🏆]/g,"").replace(/\s+/g," ").trim();
+}
+
+async function speakElevenLabs(text,onEnd){
+  const clean=cleanForTTS(text);if(!clean){onEnd?.();return;}
+  try{
+    const res=await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream`,{
+      method:"POST",headers:{"xi-api-key":ELEVENLABS_API_KEY,"Content-Type":"application/json"},
+      body:JSON.stringify({text:clean,model_id:ELEVENLABS_MODEL,voice_settings:{stability:0.55,similarity_boost:0.80,style:0.20,use_speaker_boost:true}})
+    });
+    if(!res.ok){speakBrowser(clean,onEnd);return;}
+    const blob=await res.blob();const url=URL.createObjectURL(blob);
+    const audio=new Audio(url);_activeAudio=audio;
+    audio.onended=()=>{URL.revokeObjectURL(url);_activeAudio=null;onEnd?.();};
+    audio.onerror=()=>{URL.revokeObjectURL(url);_activeAudio=null;onEnd?.();};
+    audio.play();
+  }catch(err){speakBrowser(cleanForTTS(text),onEnd);}
+}
+
+function speakBrowser(text,onEnd){
+  if(!window.speechSynthesis){onEnd?.();return;}
+  window.speechSynthesis.cancel();
+  const utt=new SpeechSynthesisUtterance(text);
+  utt.rate=0.90;utt.pitch=0.95;utt.volume=1;
+  const vs=window.speechSynthesis.getVoices();
+  const v=vs.find(v=>/daniel|alex|fred|bruce|ralph/i.test(v.name))
+    ||vs.find(v=>v.lang==="en-GB"&&v.localService)
+    ||vs.find(v=>v.lang==="en-US"&&v.localService)
+    ||vs[0];
+  if(v)utt.voice=v;
+  utt.onend=()=>onEnd?.();
+  window.speechSynthesis.speak(utt);
+}
+
+function speak(text,onEnd){
+  const clean=cleanForTTS(text);if(!clean){onEnd?.();return;}
+  ELEVENLABS_API_KEY?speakElevenLabs(clean,onEnd):speakBrowser(clean,onEnd);
+}
+
+// ─── IMPROVED TUTOR SYSTEM ────────────────────────────────────────────────────
+async function askTutor(messages, q, unitLabel, subject, wrongAnswer, grade, levelIdx) {
+  const diff = difficulty(levelIdx||0);
+  const isWrongAnswer = wrongAnswer !== null && wrongAnswer !== undefined;
+
+  const sys = `You are "Max", an experienced and warm high school teacher tutoring a Grade ${grade} student on ${subject} — specifically "${unitLabel}" (difficulty level: ${diff.label}).
+
+THE PROBLEM: "${q.text}"
+CORRECT ANSWER: "${q.answer}"
+STUDENT'S ANSWER: "${isWrongAnswer ? wrongAnswer : "ran out of time"}"
+
+YOUR JOB — diagnose WHY they got it wrong and explain it clearly:
+1. First, acknowledge what they tried (don't shame them)
+2. Identify the SPECIFIC misconception or error in their thinking
+3. Explain the concept using a concrete real-world analogy relevant to a ${grade}th grader
+4. Walk them through the correct reasoning step by step
+5. End with a check: ask them to confirm they understand or try a simpler version mentally
+
+RULES:
+- Sound like a REAL TEACHER, not a cheerleader. Warm but substantive.
+- 3-5 sentences max per response. Don't pad with filler.
+- When they answer follow-up questions correctly, praise specifically what they did right.
+- If they're still confused, try a DIFFERENT analogy or approach — don't repeat the same explanation.
+- Use numbers and specifics, not vague encouragement.
+- No excessive emojis — max 1 per message.`;
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({model:"claude-sonnet-4-20250514", max_tokens:1000, system:sys, messages})
+  });
+  const d = await res.json();
+  return d.content?.[0]?.text || "Let me think about how to explain this differently. What part is confusing you?";
+}
+
+// ─── IMPROVED STEP EXPLANATIONS ──────────────────────────────────────────────
+function getSteps(q, subject, levelIdx) {
+  if(subject!=="math") return [
+    `The question was: "${q.text}"`,
+    `The correct answer is: "${q.answer}"`,
+    `Here's how to think about it: look for key words in the question that point to the answer.`,
+    `Connect this to what you already know — what does this remind you of?`,
+    `The answer is "${q.answer}" — remember this for next time. You've got this! ✅`,
+  ];
+  const {op,a,b,answer,n,to}=q;
+  switch(op){
+    case "mul": return [
+      `Problem: ${a} × ${b} — this means "${a} equal groups, each with ${b} items."`,
+      `Picture it: ${Math.min(a,5)} rows of ${b} objects${a>5?" (and more rows)":""}. Count them all up.`,
+      `Add ${b} a total of ${a} times: ${Array.from({length:Math.min(a,6)},()=>b).join(" + ")}${a>6?" + ...":""}.`,
+      `${a} × ${b} = ${answer}. The shortcut: memorize your times tables — it'll save you tons of time. ✅`,
+    ];
+    case "div": return [
+      `Problem: ${a} ÷ ${b} — this asks "how many groups of ${b} fit inside ${a}?"`,
+      `Think of it as sharing: if ${a} items are split into groups of ${b}, how many groups do you get?`,
+      `Count up by ${b}s: ${Array.from({length:Math.min(answer,8)},(_,i)=>(i+1)*b).join(", ")}${answer>8?" ...":""} — that's ${answer} groups.`,
+      `Check your work: ${answer} × ${b} = ${a}. Division and multiplication are opposites! ✅`,
+    ];
+    case "add": return [
+      `Problem: ${a} + ${b}. Start with the larger number to make it easier.`,
+      `Put ${Math.max(a,b)} in your head. Now count up ${Math.min(a,b)} more: ${Math.max(a,b)} → ${answer}.`,
+      `Or use place value: ${Math.floor(a/10)*10} + ${Math.floor(b/10)*10} = ${Math.floor(a/10)*10+Math.floor(b/10)*10}, then add the ones: ${a%10} + ${b%10} = ${(a%10)+(b%10)}.`,
+      `${a} + ${b} = ${answer}. Always check by doing it the opposite way: ${answer} − ${b} = ${a}. ✅`,
+    ];
+    case "sub": return [
+      `Problem: ${a} − ${b}. Think of it as: "what do I add to ${b} to get ${a}?"`,
+      `Count up from ${b} to ${a}: ${b} + ? = ${a}. The gap is ${answer}.`,
+      `Or count back: start at ${a}, take away ${b}, land on ${answer}.`,
+      `Check: ${answer} + ${b} = ${a}. Subtraction and addition always undo each other. ✅`,
+    ];
+    case "round": return [
+      `Round ${n} to the nearest ${to}. Find the two multiples of ${to} on either side.`,
+      `${Math.floor(n/to)*to} ← ${n} → ${Math.floor(n/to)*to+to}. The midpoint is ${Math.floor(n/to)*to+to/2}.`,
+      `${n} is ${n>=(Math.floor(n/to)*to+to/2)?"at or above":"below"} the midpoint, so round ${n>=(Math.floor(n/to)*to+to/2)?"UP":"DOWN"}.`,
+      `Answer: ${answer}. Rule: if the digit is 5 or more, round up. Less than 5, round down. ✅`,
+    ];
+    case "missing": return [
+      `Problem: ${a} × ? = ${b}. We need the missing factor.`,
+      `Flip it into a division problem: ${b} ÷ ${a} = ?`,
+      `${b} ÷ ${a} = ${answer}. Check: ${a} × ${answer} = ${b}. Correct! ✅`,
+      `Key insight: multiplication and division are two sides of the same fact family. ✅`,
+    ];
+    case "place": return [
+      `${a} tens means ${a} × 10 = ${a*10}. Plus ${b} ones = ${b}.`,
+      `${a*10} + ${b} = ${answer}. Think of it like money: ${a} dimes (${a*10}¢) + ${b} pennies = ${answer}¢.`,
+      `Answer: ${answer}. ✅`,
+    ];
+    default: return [
+      `The correct answer is "${answer}".`,
+      `Re-read the question carefully and identify what operation to use.`,
+      `Check your work by working backwards from the answer. ✅`,
+    ];
+  }
+}
+
+// ─── COIN RESULT MODAL ────────────────────────────────────────────────────────
+function CoinModal({coins, pct, levelLabel, tier, onClose}) {
+  const msg = pct>=90?"Outstanding work!":pct>=75?"Solid effort!":pct>=60?"Good start!":"Keep practicing!";
+  const tierColor = tier==="beyond"?"#C3A6FF":tier==="extended"?"#FFE66D":"#4ECDC4";
+  return(
+    <div style={{position:"fixed",inset:0,zIndex:200,background:"rgba(0,0,0,0.75)",display:"flex",alignItems:"center",justifyContent:"center",padding:20}} onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()} style={{background:"linear-gradient(160deg,#1a1a2e,#16213e)",border:`2px solid ${tierColor}44`,borderRadius:24,padding:"32px 28px",maxWidth:340,width:"100%",textAlign:"center",animation:"pop 0.4s ease-out"}}>
+        <div style={{fontSize:52,marginBottom:8}}>🪙</div>
+        <div style={{color:"#FFE66D",fontFamily:"'Fredoka One'",fontSize:42,marginBottom:4}}>+{coins}</div>
+        <div style={{color:"rgba(255,255,255,0.5)",fontSize:13,marginBottom:16}}>coins earned</div>
+        <div style={{color:"white",fontFamily:"'Fredoka One'",fontSize:20,marginBottom:6}}>{msg}</div>
+        <div style={{color:"rgba(255,255,255,0.35)",fontSize:12,marginBottom:6}}>{levelLabel}</div>
+        <div style={{background:`${tierColor}22`,border:`1px solid ${tierColor}44`,borderRadius:20,padding:"4px 14px",display:"inline-block",marginBottom:20}}>
+          <span style={{color:tierColor,fontSize:12,fontWeight:700}}>{tier==="beyond"?"🚀 Beyond Grade ×2":tier==="extended"?"⚡ Challenge ×1.5":"📚 Curriculum ×1"}</span>
+        </div>
+        <div style={{background:"rgba(255,255,255,0.06)",borderRadius:14,padding:"12px",marginBottom:18}}>
+          <div style={{color:"rgba(255,255,255,0.4)",fontSize:11,marginBottom:4}}>Score breakdown</div>
+          <div style={{display:"flex",justifyContent:"space-between",color:"white",fontSize:13}}>
+            <span>Accuracy</span><span style={{color:pct>=75?"#4ECDC4":"#FFE66D"}}>{pct}%</span>
+          </div>
+          <div style={{display:"flex",justifyContent:"space-between",color:"white",fontSize:13,marginTop:4}}>
+            <span>Coins earned</span><span style={{color:"#FFE66D"}}>🪙 {coins}</span>
+          </div>
+        </div>
+        <button onClick={onClose} style={{background:"#FFE66D",border:"none",borderRadius:13,padding:"13px 32px",color:"#1a1a2e",fontFamily:"'Fredoka One'",fontSize:17,cursor:"pointer",width:"100%"}}>
+          Awesome! Continue →
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── UI PRIMITIVES ────────────────────────────────────────────────────────────
 function Stars({count}){return <div style={{display:"flex",gap:3}}>{[1,2,3].map(i=><span key={i} style={{fontSize:15,filter:i<=count?"none":"grayscale(1) opacity(0.2)"}}>⭐</span>)}</div>;}
 function Bar({value,color}){return <div style={{background:"rgba(255,255,255,0.1)",borderRadius:99,height:5,overflow:"hidden"}}><div style={{height:"100%",borderRadius:99,background:color,width:`${Math.min(100,value)}%`,transition:"width 0.5s"}}/></div>;}
 
@@ -213,127 +431,14 @@ const CSS=`@import url('https://fonts.googleapis.com/css2?family=Fredoka+One&fam
 @keyframes shimmer{0%{background-position:200% center}100%{background-position:-200% center}}
 @keyframes slideUp{0%{transform:translateY(14px);opacity:0}100%{transform:translateY(0);opacity:1}}
 @keyframes bounce{0%,100%{transform:translateY(0)}50%{transform:translateY(-5px)}}
+@keyframes coinPop{0%{transform:scale(0) rotate(-10deg);opacity:0}60%{transform:scale(1.2) rotate(5deg)}100%{transform:scale(1) rotate(0deg);opacity:1}}
 .card-hover{transition:transform 0.2s;cursor:pointer;}.card-hover:hover{transform:translateY(-4px) scale(1.02);}
 .btn-hover{transition:transform 0.15s;cursor:pointer;}.btn-hover:hover{transform:scale(1.04);}
 .choice-btn{transition:all 0.15s;cursor:pointer;}.choice-btn:hover{transform:scale(1.03);}
 .tab-btn{transition:all 0.2s;cursor:pointer;}textarea:focus{outline:none;}input:focus{outline:none;}`;
 
-// ─── ELEVENLABS VOICE CONFIG ──────────────────────────────────────────────────
-// Paste your ElevenLabs API key here. Get one free at https://elevenlabs.io
-// Leave empty ("") to use browser TTS fallback.
-const ELEVENLABS_API_KEY = "";
-
-// Best free voices for a friendly tutor character:
-//   "nPczCjzI2devNBz1zQrb" = Brian  (warm, clear American male)
-//   "EXAVITQu4vr4xnSDxMaL" = Bella  (warm American female)
-//   "FGY2WhTYpPnrIDTdsKH5" = Laura  (upbeat American female)
-//   "TX3LPaxmHKxFdv7VOQHJ" = Liam   (energetic American male — great for kids)
-const ELEVENLABS_VOICE_ID = "TX3LPaxmHKxFdv7VOQHJ"; // Liam — friendly & energetic
-const ELEVENLABS_MODEL    = "eleven_flash_v2_5";      // fastest, lowest latency
-
-// Active audio element for stopping playback
-let _activeAudio = null;
-
-function stopSpeech() {
-  if (_activeAudio) {
-    _activeAudio.pause();
-    _activeAudio.src = "";
-    _activeAudio = null;
-  }
-  try { window.speechSynthesis?.cancel(); } catch {}
-}
-
-// Strip emojis and clean text for TTS
-function cleanForTTS(text) {
-  return text
-    .replace(/[\u{1F000}-\u{1FFFF}]/gu, "")
-    .replace(/[\u{2600}-\u{27BF}]/gu, "")
-    .replace(/[✅❌⭐🔊🔇■▶]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-async function speakElevenLabs(text, onEnd) {
-  const clean = cleanForTTS(text);
-  if (!clean) { onEnd?.(); return; }
-
-  try {
-    const res = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream`,
-      {
-        method: "POST",
-        headers: {
-          "xi-api-key": ELEVENLABS_API_KEY,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          text: clean,
-          model_id: ELEVENLABS_MODEL,
-          voice_settings: {
-            stability: 0.45,        // a little expressive variation
-            similarity_boost: 0.80,
-            style: 0.35,            // adds friendliness/warmth
-            use_speaker_boost: true,
-          },
-        }),
-      }
-    );
-
-    if (!res.ok) {
-      console.warn("ElevenLabs error:", res.status, await res.text());
-      speakBrowser(clean, onEnd); // fallback
-      return;
-    }
-
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const audio = new Audio(url);
-    _activeAudio = audio;
-    audio.onended = () => {
-      URL.revokeObjectURL(url);
-      _activeAudio = null;
-      onEnd?.();
-    };
-    audio.onerror = () => {
-      URL.revokeObjectURL(url);
-      _activeAudio = null;
-      onEnd?.();
-    };
-    audio.play();
-  } catch (err) {
-    console.warn("ElevenLabs fetch failed, falling back to browser TTS:", err);
-    speakBrowser(cleanForTTS(text), onEnd);
-  }
-}
-
-function speakBrowser(text, onEnd) {
-  if (!window.speechSynthesis) { onEnd?.(); return; }
-  window.speechSynthesis.cancel();
-  const utt = new SpeechSynthesisUtterance(text);
-  utt.rate = 0.93; utt.pitch = 1.05; utt.volume = 1;
-  const vs = window.speechSynthesis.getVoices();
-  const v = vs.find(v => /samantha|karen|moira|ava|allison/i.test(v.name))
-    || vs.find(v => v.lang === "en-US" && v.localService)
-    || vs.find(v => v.lang.startsWith("en"))
-    || vs[0];
-  if (v) utt.voice = v;
-  utt.onend = () => onEnd?.();
-  window.speechSynthesis.speak(utt);
-}
-
-// Main speak function — uses ElevenLabs if key set, else browser
-function speak(text, onEnd) {
-  const clean = cleanForTTS(text);
-  if (!clean) { onEnd?.(); return; }
-  if (ELEVENLABS_API_KEY) {
-    speakElevenLabs(clean, onEnd);
-  } else {
-    speakBrowser(clean, onEnd);
-  }
-}
-
-
-function TutorPanel({question,unitLabel,subject,grade,wrongAnswer,color,onContinue}){
+// ─── TUTOR PANEL ─────────────────────────────────────────────────────────────
+function TutorPanel({question,unitLabel,subject,grade,wrongAnswer,color,levelIdx,onContinue}){
   const [messages,setMessages]=useState([]);
   const [input,setInput]=useState("");
   const [loading,setLoading]=useState(true);
@@ -343,53 +448,40 @@ function TutorPanel({question,unitLabel,subject,grade,wrongAnswer,color,onContin
   const [activeStep,setActiveStep]=useState(null);
   const chatEndRef=useRef(null);
   const voiceRef=useRef(true);
-  const steps=getSteps(question,subject);
+  const steps=getSteps(question,subject,levelIdx);
 
-  useEffect(()=>{ voiceRef.current=voiceOn; },[voiceOn]);
-
-  const sayIt = useCallback((text)=>{
-    if(!voiceRef.current) return;
-    setIsSpeaking(true);
-    speak(text, ()=>setIsSpeaking(false));
-  },[]);
-
+  useEffect(()=>{voiceRef.current=voiceOn;},[voiceOn]);
+  const sayIt=useCallback((text)=>{if(!voiceRef.current)return;setIsSpeaking(true);speak(text,()=>setIsSpeaking(false));},[]);
   useEffect(()=>()=>stopSpeech(),[]);
   useEffect(()=>{chatEndRef.current?.scrollIntoView({behavior:"smooth"});},[messages,loading]);
 
   useEffect(()=>{(async()=>{
-    const intro=[{role:"user",content:`I got this wrong. I said "${wrongAnswer??"nothing"}" but the answer is "${question.answer}". Help me understand!`}];
-    const reply=await askTutor(intro,question,unitLabel,subject,wrongAnswer,grade);
+    const intro=[{role:"user",content:`I answered "${wrongAnswer??"nothing — time ran out"}" but the correct answer is "${question.answer}". Can you explain what I did wrong and how to think about it correctly?`}];
+    const reply=await askTutor(intro,question,unitLabel,subject,wrongAnswer,grade,levelIdx);
     setMessages([intro[0],{role:"assistant",content:reply}]);
     setLoading(false);
     setTimeout(()=>sayIt(reply),400);
   })();},[]);
 
-  const handleStepTap=(step,i)=>{
-    setActiveStep(i); stopSpeech(); sayIt(step);
-  };
+  const handleStepTap=(step,i)=>{setActiveStep(i);stopSpeech();sayIt(step);};
 
   const send=async()=>{
     if(!input.trim()||loading)return;
     stopSpeech();
-    const u={role:"user",content:input.trim()};
-    const upd=[...messages,u];
+    const u={role:"user",content:input.trim()};const upd=[...messages,u];
     setMessages(upd);setInput("");setLoading(true);
-    const r=await askTutor(upd,question,unitLabel,subject,wrongAnswer,grade);
+    const r=await askTutor(upd,question,unitLabel,subject,wrongAnswer,grade,levelIdx);
     setMessages(m=>[...m,{role:"assistant",content:r}]);
-    setLoading(false);
-    setTimeout(()=>sayIt(r),200);
+    setLoading(false);setTimeout(()=>sayIt(r),200);
   };
+
   return(
     <div style={{position:"fixed",inset:0,zIndex:100,background:"linear-gradient(160deg,#0d1117,#161b22)",display:"flex",flexDirection:"column",fontFamily:"'Nunito',sans-serif"}}>
       <style>{CSS}</style>
 
       {/* Header */}
       <div style={{background:"rgba(255,255,255,0.04)",borderBottom:"1px solid rgba(255,255,255,0.08)",padding:"11px 13px",display:"flex",alignItems:"center",gap:9}}>
-        <div style={{width:42,height:42,borderRadius:12,
-          background:`linear-gradient(135deg,${color},${color}88)`,
-          display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,flexShrink:0,
-          animation:isSpeaking?"bounce 0.4s ease-in-out infinite":"bounce 2s ease-in-out infinite",
-          boxShadow:isSpeaking?`0 0 18px ${color}99`:"none",transition:"box-shadow 0.3s"}}>🦉</div>
+        <div style={{width:42,height:42,borderRadius:12,background:`linear-gradient(135deg,${color},${color}88)`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,flexShrink:0,animation:isSpeaking?"bounce 0.4s ease-in-out infinite":"bounce 2s ease-in-out infinite",boxShadow:isSpeaking?`0 0 18px ${color}99`:"none",transition:"box-shadow 0.3s"}}>🦉</div>
         <div>
           <div style={{color:"white",fontFamily:"'Fredoka One'",fontSize:15}}>Max — Your Tutor</div>
           <div style={{display:"flex",alignItems:"center",gap:5,color:isSpeaking?"#FFE66D":"#4ECDC4",fontSize:11,fontWeight:700,transition:"color 0.3s"}}>
@@ -398,8 +490,7 @@ function TutorPanel({question,unitLabel,subject,grade,wrongAnswer,color,onContin
           </div>
         </div>
         <div style={{marginLeft:"auto",display:"flex",gap:6,alignItems:"center"}}>
-          <button onClick={()=>{setVoiceOn(v=>{if(v)stopSpeech();return !v;})}} title={voiceOn?"Mute Max":"Unmute Max"}
-            style={{background:voiceOn?`${color}22`:"rgba(255,255,255,0.05)",border:`1.5px solid ${voiceOn?color+"44":"rgba(255,255,255,0.1)"}`,borderRadius:9,width:34,height:34,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,cursor:"pointer",flexShrink:0}}>
+          <button onClick={()=>{setVoiceOn(v=>{if(v)stopSpeech();return !v;})}} style={{background:voiceOn?`${color}22`:"rgba(255,255,255,0.05)",border:`1.5px solid ${voiceOn?color+"44":"rgba(255,255,255,0.1)"}`,borderRadius:9,width:34,height:34,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,cursor:"pointer",flexShrink:0}}>
             {voiceOn?"🔊":"🔇"}
           </button>
           {isSpeaking&&<button onClick={stopSpeech} style={{background:"rgba(255,107,107,0.15)",border:"1.5px solid rgba(255,107,107,0.3)",borderRadius:9,width:34,height:34,display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,cursor:"pointer",color:"#FF6B6B",fontWeight:900,flexShrink:0}}>■</button>}
@@ -409,11 +500,11 @@ function TutorPanel({question,unitLabel,subject,grade,wrongAnswer,color,onContin
 
       {/* Wrong answer banner */}
       <div style={{margin:"9px 13px 0",background:"rgba(255,107,107,0.08)",border:"1.5px solid rgba(255,107,107,0.2)",borderRadius:13,padding:"9px 13px",animation:"pop 0.3s ease-out"}}>
-        <div style={{color:"rgba(255,255,255,0.3)",fontSize:10,fontWeight:800,letterSpacing:1,marginBottom:4}}>{unitLabel.toUpperCase()}</div>
+        <div style={{color:"rgba(255,255,255,0.3)",fontSize:10,fontWeight:800,letterSpacing:1,marginBottom:4}}>{unitLabel.toUpperCase()} · {difficulty(levelIdx||0).label.toUpperCase()}</div>
         <div style={{color:"white",fontFamily:"'Fredoka One'",fontSize:question.text?.length>60?15:18,lineHeight:1.4}}>{question.text}</div>
         <div style={{display:"flex",gap:7,marginTop:7,flexWrap:"wrap"}}>
-          <span style={{background:"rgba(255,107,107,0.2)",border:"1px solid #FF6B6B44",borderRadius:7,padding:"3px 9px",color:"#FF6B6B",fontSize:12,fontWeight:700}}>✗ You: {wrongAnswer??"timed out"}</span>
-          <span style={{background:"rgba(78,205,196,0.2)",border:"1px solid #4ECDC444",borderRadius:7,padding:"3px 9px",color:"#4ECDC4",fontSize:12,fontWeight:700}}>✓ Answer: {question.answer}</span>
+          <span style={{background:"rgba(255,107,107,0.2)",border:"1px solid #FF6B6B44",borderRadius:7,padding:"3px 9px",color:"#FF6B6B",fontSize:12,fontWeight:700}}>✗ You said: {wrongAnswer??"timed out"}</span>
+          <span style={{background:"rgba(78,205,196,0.2)",border:"1px solid #4ECDC444",borderRadius:7,padding:"3px 9px",color:"#4ECDC4",fontSize:12,fontWeight:700}}>✓ Correct: {question.answer}</span>
         </div>
       </div>
 
@@ -422,26 +513,15 @@ function TutorPanel({question,unitLabel,subject,grade,wrongAnswer,color,onContin
         {["📋 Steps","💬 Ask Max"].map((tab,i)=><button key={i} className="tab-btn" onClick={()=>{stopSpeech();setShowChat(i===1);}} style={{flex:1,padding:"9px",borderRadius:10,fontFamily:"'Fredoka One'",fontSize:13,border:"none",background:showChat===(i===1)?color:"rgba(255,255,255,0.06)",color:showChat===(i===1)?"#1a1a2e":"rgba(255,255,255,0.5)"}}>{tab}</button>)}
       </div>
 
-      {/* Steps tab — each step is tappable to hear it */}
+      {/* Steps tab */}
       {!showChat&&<div style={{flex:1,overflow:"auto",padding:"11px 13px"}}>
-        <div style={{color:"rgba(255,255,255,0.3)",fontSize:10,fontWeight:800,letterSpacing:1,marginBottom:8}}>TAP ANY STEP TO HEAR MAX EXPLAIN IT 🔊</div>
+        <div style={{color:"rgba(255,255,255,0.3)",fontSize:10,fontWeight:800,letterSpacing:1,marginBottom:8}}>TAP A STEP TO HEAR IT</div>
         {steps.map((step,i)=>(
-          <div key={i} onClick={()=>handleStepTap(step,i)}
-            style={{display:"flex",gap:9,marginBottom:8,animation:`slideUp 0.3s ease-out ${i*0.07}s both`,cursor:"pointer",
-              opacity:activeStep!==null&&activeStep!==i?0.6:1,transition:"opacity 0.2s"}}>
-            <div style={{width:26,height:26,borderRadius:7,flexShrink:0,
-              background:activeStep===i?color:i===steps.length-1?"#4ECDC4":`${color}25`,
-              border:`1.5px solid ${activeStep===i?color:i===steps.length-1?"#4ECDC4":color+"44"}`,
-              display:"flex",alignItems:"center",justifyContent:"center",
-              color:activeStep===i||i===steps.length-1?"#1a1a2e":color,
-              fontSize:11,fontFamily:"'Fredoka One'",transition:"all 0.2s",
-              boxShadow:activeStep===i?`0 0 10px ${color}88`:"none"}}>
+          <div key={i} onClick={()=>handleStepTap(step,i)} style={{display:"flex",gap:9,marginBottom:8,animation:`slideUp 0.3s ease-out ${i*0.07}s both`,cursor:"pointer",opacity:activeStep!==null&&activeStep!==i?0.55:1,transition:"opacity 0.2s"}}>
+            <div style={{width:26,height:26,borderRadius:7,flexShrink:0,background:activeStep===i?color:i===steps.length-1?"#4ECDC4":`${color}25`,border:`1.5px solid ${activeStep===i?color:i===steps.length-1?"#4ECDC4":color+"44"}`,display:"flex",alignItems:"center",justifyContent:"center",color:activeStep===i||i===steps.length-1?"#1a1a2e":color,fontSize:11,fontFamily:"'Fredoka One'",transition:"all 0.2s",boxShadow:activeStep===i?`0 0 10px ${color}88`:"none"}}>
               {activeStep===i?"▶":i+1}
             </div>
-            <div style={{flex:1,background:activeStep===i?`${color}18`:"rgba(255,255,255,0.05)",borderRadius:9,padding:"7px 11px",color:"white",fontSize:13,lineHeight:1.6,
-              fontWeight:i===steps.length-1?700:400,
-              border:activeStep===i?`1.5px solid ${color}55`:i===steps.length-1?"1.5px solid #4ECDC433":"1.5px solid rgba(255,255,255,0.06)",
-              transition:"all 0.2s"}}>{step}</div>
+            <div style={{flex:1,background:activeStep===i?`${color}18`:"rgba(255,255,255,0.05)",borderRadius:9,padding:"7px 11px",color:"white",fontSize:13,lineHeight:1.6,fontWeight:i===steps.length-1?700:400,border:activeStep===i?`1.5px solid ${color}55`:i===steps.length-1?"1.5px solid #4ECDC433":"1.5px solid rgba(255,255,255,0.06)",transition:"all 0.2s"}}>{step}</div>
           </div>
         ))}
         <button className="tab-btn" onClick={()=>{stopSpeech();setShowChat(true);}} style={{width:"100%",marginTop:7,background:`${color}15`,border:`1.5px solid ${color}44`,borderRadius:11,padding:11,color,fontFamily:"'Fredoka One'",fontSize:14,cursor:"pointer"}}>Still confused? Ask Max! 💬</button>
@@ -455,7 +535,7 @@ function TutorPanel({question,unitLabel,subject,grade,wrongAnswer,color,onContin
               {m.role==="assistant"&&<div style={{width:26,height:26,borderRadius:8,background:`${color}25`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,marginRight:6,flexShrink:0}}>🦉</div>}
               <div style={{maxWidth:"78%",padding:"8px 12px",borderRadius:m.role==="user"?"13px 13px 4px 13px":"13px 13px 13px 4px",background:m.role==="user"?color:"rgba(255,255,255,0.08)",color:m.role==="user"?"#1a1a2e":"white",fontSize:13,lineHeight:1.6,fontWeight:m.role==="user"?700:400}}>
                 {m.content}
-                {m.role==="assistant"&&<button onClick={()=>sayIt(m.content)} title="Hear this again" style={{display:"inline-block",marginLeft:6,background:"none",border:"none",cursor:"pointer",fontSize:12,opacity:0.5,verticalAlign:"middle"}}>🔊</button>}
+                {m.role==="assistant"&&<button onClick={()=>sayIt(m.content)} style={{display:"inline-block",marginLeft:6,background:"none",border:"none",cursor:"pointer",fontSize:12,opacity:0.5,verticalAlign:"middle"}}>🔊</button>}
               </div>
             </div>
           ))}
@@ -468,7 +548,7 @@ function TutorPanel({question,unitLabel,subject,grade,wrongAnswer,color,onContin
           <div ref={chatEndRef}/>
         </div>
         <div style={{borderTop:"1px solid rgba(255,255,255,0.07)",padding:"9px 13px",display:"flex",gap:7,alignItems:"flex-end",background:"rgba(0,0,0,0.2)"}}>
-          <textarea value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();}}} placeholder="Ask Max anything..." rows={1} style={{flex:1,background:"rgba(255,255,255,0.07)",border:"1.5px solid rgba(255,255,255,0.12)",borderRadius:10,padding:"9px 11px",color:"white",fontSize:13,fontFamily:"'Nunito'",resize:"none",maxHeight:90}}/>
+          <textarea value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();}}} placeholder="Ask Max to explain differently, give an example, or check your thinking..." rows={1} style={{flex:1,background:"rgba(255,255,255,0.07)",border:"1.5px solid rgba(255,255,255,0.12)",borderRadius:10,padding:"9px 11px",color:"white",fontSize:13,fontFamily:"'Nunito'",resize:"none",maxHeight:90}}/>
           <button onClick={send} disabled={loading||!input.trim()} style={{background:input.trim()&&!loading?color:"rgba(255,255,255,0.07)",border:"none",borderRadius:9,width:36,height:36,fontSize:14,cursor:input.trim()&&!loading?"pointer":"default",transition:"all 0.2s",display:"flex",alignItems:"center",justifyContent:"center",color:input.trim()&&!loading?"#1a1a2e":"rgba(255,255,255,0.25)",flexShrink:0}}>➤</button>
         </div>
       </div>}
@@ -476,9 +556,11 @@ function TutorPanel({question,unitLabel,subject,grade,wrongAnswer,color,onContin
   );
 }
 
-
 // ─── MAIN APP ────────────────────────────────────────────────────────────────
-const TOTAL_Q=8, Q_TIME=30, STAR_T=[60,75,90];
+const TOTAL_Q=10, Q_TIME=30, STAR_T=[60,75,90];
+
+// 10 levels per unit — built dynamically in the levels screen
+// Level tiers: 1-5 = grade curriculum, 6-8 = extended challenge, 9-10 = beyond grade
 
 export default function Clariva() {
   const [screen,setScreen]=useState("onboard");
@@ -497,20 +579,44 @@ export default function Clariva() {
   const [showTutor,setShowTutor]=useState(false);
   const [wrongAnswer,setWrongAnswer]=useState(null);
   const [streakCount,setStreakCount]=useState(0);
-  const [progress,setProgress]=useState(()=>{try{const s=localStorage.getItem("clariva_v3");return s?JSON.parse(s):{}}catch{return {};}});
+  const [showCoinModal,setShowCoinModal]=useState(false);
+  const [lastCoins,setLastCoins]=useState(0);
+  const [lastPct,setLastPct]=useState(0);
 
-  useEffect(()=>{try{localStorage.setItem("clariva_v3",JSON.stringify(progress));}catch{}},[progress]);
+  const [progress,setProgress]=useState(()=>{try{const s=localStorage.getItem("clariva_v4");return s?JSON.parse(s):{}}catch{return {};}});
+  const [coins,setCoins]=useState(()=>{try{return Number(localStorage.getItem("clariva_coins")||0)}catch{return 0;}});
+
+  useEffect(()=>{try{localStorage.setItem("clariva_v4",JSON.stringify(progress));}catch{}},[progress]);
+  useEffect(()=>{try{localStorage.setItem("clariva_coins",String(coins));}catch{}},[coins]);
+
   const totalStars=Object.values(progress).flatMap(s=>Object.values(s).flatMap(u=>Object.values(u))).reduce((a,b)=>a+b,0);
 
   const saveProg=useCallback((sid,uid,lvl,pct)=>{
     const stars=pct>=STAR_T[2]?3:pct>=STAR_T[1]?2:pct>=STAR_T[0]?1:0;
+    const earned=calcCoins(pct, lvl);
     setProgress(prev=>{const s=prev[sid]||{};const u=s[uid]||{};return {...prev,[sid]:{...s,[uid]:{...u,[lvl]:Math.max(u[lvl]||0,stars)}}};});
-    return stars;
+    setCoins(c=>c+earned);
+    return {stars, earned};
   },[]);
 
+  // Generate 10 levels for any unit using difficulty multiplier
+  function getLevelsFor(unit) {
+    const base = unit.levels || [];
+    // Take the 5 LVUSD labels, then add 5 more
+    const gradeLabels = base.slice(0,5).map(l=>l.label);
+    while(gradeLabels.length<5) gradeLabels.push(`Level ${gradeLabels.length+1}`);
+    const nextGradeLabel = unit.beyondGrade ? "Advanced I" : `Grade ${Number(grade)+1} Intro`;
+    return buildLevels(gradeLabels, [nextGradeLabel,"Advanced II"]);
+  }
+
   const startQuiz=(unit,levelIdx)=>{
-    const qs=Array.from({length:TOTAL_Q},()=>generateQuestion(activeSubject.id,unit,levelIdx));
-    setQuestions(qs);setQIndex(0);setScore(0);setSelected(null);setFeedback(null);setTimeLeft(Q_TIME);setActiveUnit(unit);setActiveLevel(levelIdx);setStreakCount(0);setShowTutor(false);setScreen("quiz");
+    const qs=Array.from({length:TOTAL_Q},()=>{
+      const q=generateQuestion(activeSubject.id,unit,levelIdx);
+      return q;
+    });
+    setQuestions(qs);setQIndex(0);setScore(0);setSelected(null);setFeedback(null);
+    setTimeLeft(Q_TIME);setActiveUnit(unit);setActiveLevel(levelIdx);
+    setStreakCount(0);setShowTutor(false);setScreen("quiz");
   };
 
   useEffect(()=>{
@@ -531,12 +637,23 @@ export default function Clariva() {
   const advance=(ok=true)=>{
     setShowTutor(false);
     const next=qIndex+1;
-    if(next>=TOTAL_Q){const f=ok?score+1:score;const pct=Math.round((f/TOTAL_Q)*100);saveProg(activeSubject.id,activeUnit.id,activeLevel,pct);setScore(f);setScreen("result");}
-    else{setQIndex(next);setSelected(null);setFeedback(null);setTimeLeft(Q_TIME);}
+    if(next>=TOTAL_Q){
+      const f=ok?score+1:score;
+      const pct=Math.round((f/TOTAL_Q)*100);
+      const {earned}=saveProg(activeSubject.id,activeUnit.id,activeLevel,pct);
+      setScore(f);setLastPct(pct);setLastCoins(earned);
+      setShowCoinModal(true);
+      setScreen("result");
+    } else {setQIndex(next);setSelected(null);setFeedback(null);setTimeLeft(Q_TIME);}
   };
 
   const getStarsFor=(sid,uid,lvl)=>progress[sid]?.[uid]?.[lvl]||0;
-  const getUnitPct=(sid,uid,numLvls)=>{const e=Object.values(progress[sid]?.[uid]||{}).reduce((a,b)=>a+b,0);return Math.round((e/(numLvls*3))*100);};
+  const getUnitPct=(sid,uid)=>{
+    const all=progress[sid]?.[uid]||{};
+    const earned=Object.values(all).reduce((a,b)=>a+b,0);
+    const max=10*3;
+    return Math.round((earned/max)*100);
+  };
 
   // ── ONBOARD ──
   if(screen==="onboard") return(
@@ -550,12 +667,16 @@ export default function Clariva() {
         </div>
         <div style={{background:"rgba(255,255,255,0.06)",border:"1.5px solid rgba(255,255,255,0.1)",borderRadius:22,padding:"22px 18px"}}>
           <div style={{color:"white",fontFamily:"'Fredoka One'",fontSize:17,marginBottom:12,textAlign:"center"}}>👋 What's your name?</div>
-          <input value={nameInput} onChange={e=>setNameInput(e.target.value)} placeholder="Enter your name..." style={{width:"100%",background:"rgba(255,255,255,0.08)",border:"1.5px solid rgba(255,255,255,0.15)",borderRadius:11,padding:"11px 14px",color:"white",fontSize:15,fontFamily:"'Nunito'",marginBottom:18}}/>
+          <input value={nameInput} onChange={e=>setNameInput(e.target.value)} placeholder="Enter your name..."
+            style={{width:"100%",background:"rgba(255,255,255,0.08)",border:"1.5px solid rgba(255,255,255,0.15)",borderRadius:11,padding:"11px 14px",color:"white",fontSize:15,fontFamily:"'Nunito'",marginBottom:18}}/>
           <div style={{color:"white",fontFamily:"'Fredoka One'",fontSize:17,marginBottom:11,textAlign:"center"}}>📚 What grade are you in?</div>
           <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:7,marginBottom:20}}>
-            {GRADES.map(g=><button key={g} onClick={()=>setGrade(g)} className="btn-hover" style={{background:grade===g?"#FFE66D":"rgba(255,255,255,0.07)",border:`2px solid ${grade===g?"#FFE66D":"rgba(255,255,255,0.13)"}`,borderRadius:11,padding:"11px 4px",color:grade===g?"#1a1a2e":"white",fontFamily:"'Fredoka One'",fontSize:17,cursor:"pointer"}}>{g}<div style={{fontSize:9,marginTop:1,opacity:0.7}}>Grade</div></button>)}
+            {GRADES.map(g=><button key={g} onClick={()=>setGrade(g)} className="btn-hover"
+              style={{background:grade===g?"#FFE66D":"rgba(255,255,255,0.07)",border:`2px solid ${grade===g?"#FFE66D":"rgba(255,255,255,0.13)"}`,borderRadius:11,padding:"11px 4px",color:grade===g?"#1a1a2e":"white",fontFamily:"'Fredoka One'",fontSize:17,cursor:"pointer"}}>
+              {g}<div style={{fontSize:9,marginTop:1,opacity:0.7}}>Grade</div></button>)}
           </div>
-          <button onClick={()=>{if(grade&&nameInput.trim()){setStudentName(nameInput.trim());setScreen("subjects");}}} disabled={!grade||!nameInput.trim()} className="btn-hover"
+          <button onClick={()=>{if(grade&&nameInput.trim()){setStudentName(nameInput.trim());setScreen("subjects");}}}
+            disabled={!grade||!nameInput.trim()} className="btn-hover"
             style={{width:"100%",background:grade&&nameInput.trim()?"#FFE66D":"rgba(255,255,255,0.1)",border:"none",borderRadius:13,padding:"13px",color:grade&&nameInput.trim()?"#1a1a2e":"rgba(255,255,255,0.25)",fontFamily:"'Fredoka One'",fontSize:17,cursor:grade&&nameInput.trim()?"pointer":"default",boxShadow:grade&&nameInput.trim()?"0 4px 18px rgba(255,230,109,0.4)":"none",transition:"all 0.2s"}}>
             Let's Go! 🚀
           </button>
@@ -574,8 +695,9 @@ export default function Clariva() {
           <div style={{color:"rgba(255,255,255,0.35)",fontSize:11,marginTop:1}}>Hi {studentName}! · Grade {grade} LVUSD</div>
         </div>
         <div style={{display:"flex",gap:9,alignItems:"center"}}>
-          <div style={{background:"rgba(255,230,109,0.12)",border:"1px solid rgba(255,230,109,0.25)",borderRadius:10,padding:"6px 12px",textAlign:"center"}}>
-            <div style={{color:"#FFE66D",fontFamily:"'Fredoka One'",fontSize:15}}>⭐ {totalStars}</div>
+          <div style={{background:"rgba(255,230,109,0.12)",border:"1px solid rgba(255,230,109,0.25)",borderRadius:10,padding:"6px 12px",display:"flex",alignItems:"center",gap:6}}>
+            <span style={{fontSize:16}}>🪙</span>
+            <span style={{color:"#FFE66D",fontFamily:"'Fredoka One'",fontSize:15}}>{coins}</span>
           </div>
           <button onClick={()=>setScreen("onboard")} style={{background:"rgba(255,255,255,0.07)",border:"none",color:"rgba(255,255,255,0.4)",borderRadius:8,padding:"5px 9px",fontSize:11,cursor:"pointer",fontFamily:"'Nunito'"}}>✏️ Grade</button>
         </div>
@@ -583,15 +705,15 @@ export default function Clariva() {
       <div style={{textAlign:"center",padding:"18px 16px 6px"}}>
         <div style={{fontSize:38,display:"inline-block",animation:"float 3s ease-in-out infinite"}}>🌟</div>
         <div style={{color:"white",fontFamily:"'Fredoka One'",fontSize:21,marginTop:5}}>Choose a Subject</div>
-        <div style={{color:"rgba(255,255,255,0.35)",fontSize:12,marginTop:2}}>Grade {grade} curriculum + beyond-grade challenges</div>
+        <div style={{color:"rgba(255,255,255,0.35)",fontSize:12,marginTop:2}}>Grade {grade} curriculum · 10 levels each · earn coins</div>
       </div>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:11,padding:"10px 13px",maxWidth:490,margin:"0 auto"}}>
         {SUBJECTS.map(subj=>{
           const units=getUnits(subj.id,grade);
           const gu=units.filter(u=>!u.beyondGrade);
-          const totalL=gu.reduce((s,u)=>s+u.levels.length,0);
           const earned=gu.reduce((s,u)=>s+Object.values(progress[subj.id]?.[u.id]||{}).reduce((a,b)=>a+b,0),0);
-          const pct=totalL>0?Math.round((earned/(totalL*3))*100):0;
+          const max=gu.length*10*3;
+          const pct=max>0?Math.round((earned/max)*100):0;
           return(
             <div key={subj.id} className="card-hover" onClick={()=>{setActiveSubject(subj);setScreen("units");}}
               style={{background:`linear-gradient(135deg,${subj.color}18,${subj.color}08)`,border:`1.5px solid ${subj.color}30`,borderRadius:19,padding:"17px 13px",boxShadow:`0 4px 16px ${subj.color}12`}}>
@@ -604,10 +726,13 @@ export default function Clariva() {
           );
         })}
       </div>
-      <div style={{margin:"4px 13px",background:"rgba(78,205,196,0.07)",border:"1px solid rgba(78,205,196,0.18)",borderRadius:13,padding:"10px 14px",maxWidth:464,marginLeft:"auto",marginRight:"auto"}}>
+      {/* Coin store teaser */}
+      <div style={{margin:"8px 13px 0",background:"rgba(255,230,109,0.07)",border:"1px solid rgba(255,230,109,0.18)",borderRadius:13,padding:"10px 14px",maxWidth:464,marginLeft:"auto",marginRight:"auto"}}>
         <div style={{display:"flex",gap:9,alignItems:"center"}}>
-          <span style={{fontSize:22,flexShrink:0}}>🦉</span>
-          <div style={{color:"rgba(255,255,255,0.4)",fontSize:12,lineHeight:1.5}}><span style={{color:"#4ECDC4",fontWeight:700}}>Max</span> is your AI tutor — get a question wrong and Max explains it step-by-step and answers your questions live!</div>
+          <span style={{fontSize:22,flexShrink:0}}>🎮</span>
+          <div style={{color:"rgba(255,230,109,0.7)",fontSize:12,lineHeight:1.5}}>
+            <span style={{color:"#FFE66D",fontWeight:700}}>Earn coins</span> by completing levels — use them to unlock games! You have <span style={{color:"#FFE66D",fontWeight:700}}>🪙 {coins}</span> coins.
+          </div>
         </div>
       </div>
     </div>
@@ -624,15 +749,16 @@ export default function Clariva() {
         <div style={{padding:"13px 14px",display:"flex",alignItems:"center",gap:9}}>
           <button onClick={()=>setScreen("subjects")} className="btn-hover" style={{background:"rgba(255,255,255,0.08)",border:"none",color:"white",borderRadius:9,padding:"6px 13px",fontFamily:"'Nunito'",fontSize:13,cursor:"pointer"}}>← Subjects</button>
           <div style={{color:"rgba(255,255,255,0.4)",fontSize:12}}>{activeSubject.icon} {activeSubject.label}</div>
+          <div style={{marginLeft:"auto",color:"#FFE66D",fontFamily:"'Fredoka One'",fontSize:14}}>🪙 {coins}</div>
         </div>
         <div style={{textAlign:"center",padding:"0 16px 14px"}}>
           <div style={{fontSize:42,animation:"float 3s ease-in-out infinite",display:"inline-block"}}>{activeSubject.icon}</div>
           <div style={{color:"white",fontFamily:"'Fredoka One'",fontSize:21,marginTop:5}}>{activeSubject.label}</div>
-          <div style={{color:"rgba(255,255,255,0.35)",fontSize:12,marginTop:2}}>Grade {grade} LVUSD Curriculum</div>
+          <div style={{color:"rgba(255,255,255,0.35)",fontSize:12,marginTop:2}}>Grade {grade} LVUSD · 10 levels per unit</div>
         </div>
         <div style={{padding:"0 13px",maxWidth:450,margin:"0 auto"}}>
           {gradeUnits.map(unit=>{
-            const pct=getUnitPct(activeSubject.id,unit.id,unit.levels.length);
+            const pct=getUnitPct(activeSubject.id,unit.id);
             return(
               <div key={unit.id} className="card-hover" onClick={()=>{setActiveUnit(unit);setScreen("levels");}}
                 style={{background:`linear-gradient(135deg,${unit.color}18,${unit.color}08)`,border:`1.5px solid ${unit.color}30`,borderRadius:15,padding:"13px 15px",marginBottom:9,display:"flex",alignItems:"center",gap:11}}>
@@ -654,11 +780,8 @@ export default function Clariva() {
               </div>
               <div style={{flex:1,height:1,background:"rgba(255,230,109,0.18)"}}/>
             </div>
-            <div style={{background:"rgba(255,230,109,0.07)",border:"1px solid rgba(255,230,109,0.15)",borderRadius:11,padding:"9px 13px",marginBottom:10}}>
-              <div style={{color:"rgba(255,230,109,0.8)",fontSize:12,lineHeight:1.5}}>🎓 You've unlocked <strong>Grade {Number(grade)+1}</strong> content! These topics go beyond your LVUSD curriculum. Keep pushing!</div>
-            </div>
             {beyondUnits.map(unit=>{
-              const pct=getUnitPct(activeSubject.id,unit.id,unit.levels.length);
+              const pct=getUnitPct(activeSubject.id,unit.id);
               return(
                 <div key={unit.id} className="card-hover" onClick={()=>{setActiveUnit(unit);setScreen("levels");}}
                   style={{background:`linear-gradient(135deg,${unit.color}10,${unit.color}05)`,border:"1.5px solid rgba(255,230,109,0.2)",borderRadius:15,padding:"13px 15px",marginBottom:9,display:"flex",alignItems:"center",gap:11}}>
@@ -680,37 +803,63 @@ export default function Clariva() {
     );
   }
 
-  // ── LEVELS ──
-  if(screen==="levels") return(
-    <div style={{minHeight:"100vh",background:"linear-gradient(160deg,#0f0c29,#302b63,#24243e)",fontFamily:"'Nunito',sans-serif",paddingBottom:36}}>
-      <style>{CSS}</style>
-      <div style={{padding:"13px 14px"}}>
-        <button onClick={()=>setScreen("units")} className="btn-hover" style={{background:"rgba(255,255,255,0.08)",border:"none",color:"white",borderRadius:9,padding:"6px 13px",fontFamily:"'Nunito'",fontSize:13,cursor:"pointer"}}>← Units</button>
-      </div>
-      <div style={{textAlign:"center",padding:"0 16px 18px"}}>
-        <div style={{fontSize:44,animation:"float 3s ease-in-out infinite",display:"inline-block"}}>{activeUnit?.icon}</div>
-        <div style={{color:"white",fontFamily:"'Fredoka One'",fontSize:21,marginTop:5}}>{activeUnit?.label}</div>
-        {activeUnit?.beyondGrade&&<div style={{background:"rgba(255,230,109,0.15)",border:"1px solid rgba(255,230,109,0.3)",borderRadius:18,padding:"3px 11px",display:"inline-block",marginTop:5}}><span style={{color:"#FFE66D",fontSize:11,fontWeight:800}}>🚀 Beyond Grade {grade}</span></div>}
-        <div style={{color:"rgba(255,255,255,0.35)",fontSize:11,marginTop:4}}>{activeUnit?.standard}</div>
-      </div>
-      <div style={{display:"flex",flexDirection:"column",gap:9,padding:"0 13px",maxWidth:410,margin:"0 auto"}}>
-        {activeUnit?.levels.map((level,i)=>{
-          const stars=getStarsFor(activeSubject.id,activeUnit.id,i);
-          const locked=i>0&&getStarsFor(activeSubject.id,activeUnit.id,i-1)===0;
-          return(
-            <div key={i} onClick={()=>!locked&&startQuiz(activeUnit,i)} className={locked?"":"card-hover"}
-              style={{background:locked?"rgba(255,255,255,0.02)":`linear-gradient(135deg,${activeUnit.color}1a,${activeUnit.color}08)`,border:`1.5px solid ${locked?"rgba(255,255,255,0.06)":activeUnit.color+"40"}`,borderRadius:14,padding:"13px 15px",display:"flex",alignItems:"center",justifyContent:"space-between",opacity:locked?0.4:1}}>
-              <div style={{display:"flex",alignItems:"center",gap:9}}>
-                <div style={{width:36,height:36,borderRadius:9,background:locked?"rgba(255,255,255,0.05)":activeUnit.color,display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,fontFamily:"'Fredoka One'",color:"#1a1a2e"}}>{locked?"🔒":i+1}</div>
-                <div><div style={{color:"white",fontFamily:"'Fredoka One'",fontSize:14}}>Level {i+1}</div><div style={{color:"rgba(255,255,255,0.35)",fontSize:11}}>{level.label}</div></div>
+  // ── LEVELS (10 per unit) ──
+  if(screen==="levels"){
+    const allLevels = activeUnit ? getLevelsFor(activeUnit) : [];
+    const tierColors = {grade:"#4ECDC4", extended:"#FFE66D", beyond:"#C3A6FF"};
+    const tierLabels = {grade:"📚 Curriculum", extended:"⚡ Challenge", beyond:"🚀 Beyond"};
+    return(
+      <div style={{minHeight:"100vh",background:"linear-gradient(160deg,#0f0c29,#302b63,#24243e)",fontFamily:"'Nunito',sans-serif",paddingBottom:36}}>
+        <style>{CSS}</style>
+        <div style={{padding:"13px 14px",display:"flex",alignItems:"center",gap:9}}>
+          <button onClick={()=>setScreen("units")} className="btn-hover" style={{background:"rgba(255,255,255,0.08)",border:"none",color:"white",borderRadius:9,padding:"6px 13px",fontFamily:"'Nunito'",fontSize:13,cursor:"pointer"}}>← Units</button>
+          <div style={{marginLeft:"auto",color:"#FFE66D",fontFamily:"'Fredoka One'",fontSize:14}}>🪙 {coins}</div>
+        </div>
+        <div style={{textAlign:"center",padding:"0 16px 16px"}}>
+          <div style={{fontSize:44,animation:"float 3s ease-in-out infinite",display:"inline-block"}}>{activeUnit?.icon}</div>
+          <div style={{color:"white",fontFamily:"'Fredoka One'",fontSize:21,marginTop:5}}>{activeUnit?.label}</div>
+          <div style={{color:"rgba(255,255,255,0.35)",fontSize:11,marginTop:4}}>{activeUnit?.standard}</div>
+          {/* Coin multiplier legend */}
+          <div style={{display:"flex",gap:6,justifyContent:"center",marginTop:10,flexWrap:"wrap"}}>
+            {Object.entries(tierLabels).map(([t,label])=>(
+              <div key={t} style={{background:`${tierColors[t]}18`,border:`1px solid ${tierColors[t]}44`,borderRadius:20,padding:"3px 10px",fontSize:10,color:tierColors[t],fontWeight:700}}>{label} {t==="beyond"?"×2 coins":t==="extended"?"×1.5 coins":"×1 coins"}</div>
+            ))}
+          </div>
+        </div>
+        <div style={{display:"flex",flexDirection:"column",gap:8,padding:"0 13px",maxWidth:420,margin:"0 auto"}}>
+          {allLevels.map((level,i)=>{
+            const stars=getStarsFor(activeSubject.id,activeUnit.id,i);
+            const locked=i>0&&getStarsFor(activeSubject.id,activeUnit.id,i-1)===0;
+            const tc=tierColors[level.tier];
+            const coinsForLevel=calcCoins(90,i); // show max possible
+            const isNewTier=i===0||(allLevels[i-1]?.tier!==level.tier);
+            return(
+              <div key={i}>
+                {isNewTier&&i>0&&(
+                  <div style={{display:"flex",alignItems:"center",gap:8,margin:"10px 0 6px"}}>
+                    <div style={{flex:1,height:1,background:`${tc}33`}}/>
+                    <div style={{color:tc,fontSize:11,fontWeight:800,fontFamily:"'Fredoka One'"}}>{tierLabels[level.tier]}</div>
+                    <div style={{flex:1,height:1,background:`${tc}33`}}/>
+                  </div>
+                )}
+                <div onClick={()=>!locked&&startQuiz(activeUnit,i)} className={locked?"":"card-hover"}
+                  style={{background:locked?"rgba(255,255,255,0.02)":`linear-gradient(135deg,${tc}18,${tc}08)`,border:`1.5px solid ${locked?"rgba(255,255,255,0.06)":tc+"40"}`,borderRadius:14,padding:"12px 14px",display:"flex",alignItems:"center",justifyContent:"space-between",opacity:locked?0.35:1}}>
+                  <div style={{display:"flex",alignItems:"center",gap:9}}>
+                    <div style={{width:36,height:36,borderRadius:9,background:locked?"rgba(255,255,255,0.05)":tc,display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,fontFamily:"'Fredoka One'",color:"#1a1a2e",fontWeight:900}}>{locked?"🔒":i+1}</div>
+                    <div>
+                      <div style={{color:"white",fontFamily:"'Fredoka One'",fontSize:14}}>Level {i+1} <span style={{color:tc,fontSize:11}}>· {level.label}</span></div>
+                      <div style={{color:"rgba(255,255,255,0.3)",fontSize:11}}>Up to 🪙 {coinsForLevel} coins</div>
+                    </div>
+                  </div>
+                  <Stars count={stars}/>
+                </div>
               </div>
-              <Stars count={stars}/>
-            </div>
-          );
-        })}
+            );
+          })}
+        </div>
       </div>
-    </div>
-  );
+    );
+  }
 
   // ── QUIZ ──
   if(screen==="quiz"){
@@ -718,15 +867,16 @@ export default function Clariva() {
     if(!q)return null;
     const timerColor=timeLeft<=5?"#FF6B6B":timeLeft<=10?"#FFE66D":"#4ECDC4";
     const pct=Math.round((qIndex/TOTAL_Q)*100);
-    const isBeyond=activeUnit?.beyondGrade;
+    const diff=difficulty(activeLevel);
+    const tierColor={grade:"#4ECDC4",extended:"#FFE66D",beyond:"#C3A6FF"}[diff.tier];
     return(
       <div style={{minHeight:"100vh",background:"linear-gradient(160deg,#0f0c29,#302b63,#24243e)",fontFamily:"'Nunito',sans-serif",display:"flex",flexDirection:"column"}}>
         <style>{CSS}</style>
-        {showTutor&&q&&<TutorPanel question={q} unitLabel={activeUnit.label} subject={activeSubject.id} grade={grade} wrongAnswer={wrongAnswer} color={activeUnit.color} onContinue={()=>advance(false)}/>}
+        {showTutor&&q&&<TutorPanel question={q} unitLabel={activeUnit.label} subject={activeSubject.id} grade={grade} wrongAnswer={wrongAnswer} color={activeUnit.color} levelIdx={activeLevel} onContinue={()=>advance(false)}/>}
         <div style={{background:"rgba(255,255,255,0.04)",borderBottom:"1px solid rgba(255,255,255,0.07)",padding:"11px 13px",display:"flex",alignItems:"center",gap:9}}>
           <button onClick={()=>setScreen("levels")} style={{background:"rgba(255,255,255,0.07)",border:"none",color:"rgba(255,255,255,0.4)",borderRadius:8,padding:"5px 9px",fontFamily:"'Nunito'",fontSize:12,cursor:"pointer"}}>✕</button>
-          <div style={{flex:1}}><Bar value={pct} color={activeUnit.color}/></div>
-          {isBeyond&&<div style={{background:"rgba(255,230,109,0.15)",borderRadius:7,padding:"2px 7px",fontSize:10,color:"#FFE66D",fontWeight:800}}>🚀 G{Number(grade)+1}</div>}
+          <div style={{flex:1}}><Bar value={pct} color={tierColor}/></div>
+          <div style={{background:`${tierColor}22`,borderRadius:7,padding:"2px 8px",fontSize:10,color:tierColor,fontWeight:800}}>L{activeLevel+1} · {diff.label}</div>
           <span style={{color:"rgba(255,255,255,0.4)",fontSize:12}}>{qIndex}/{TOTAL_Q}</span>
         </div>
         <div style={{display:"flex",justifyContent:"space-between",padding:"9px 13px",alignItems:"center"}}>
@@ -735,15 +885,16 @@ export default function Clariva() {
           </div>
           <div style={{color:"rgba(255,255,255,0.35)",fontSize:11,textAlign:"center"}}>
             <div style={{color:"white",fontFamily:"'Fredoka One'",fontSize:12}}>{activeUnit?.label}</div>
-            <div>{activeUnit?.levels[activeLevel]?.label}</div>
           </div>
-          <div style={{background:"rgba(255,230,109,0.1)",border:"1px solid rgba(255,230,109,0.22)",borderRadius:9,padding:"5px 11px",display:"flex",alignItems:"center",gap:4}}>
-            <span>⭐</span><span style={{color:"#FFE66D",fontFamily:"'Fredoka One'",fontSize:17}}>{score}</span>
+          <div style={{display:"flex",gap:6,alignItems:"center"}}>
+            <div style={{background:"rgba(255,230,109,0.1)",border:"1px solid rgba(255,230,109,0.22)",borderRadius:9,padding:"5px 11px",display:"flex",alignItems:"center",gap:3}}>
+              <span style={{fontSize:12}}>🪙</span><span style={{color:"#FFE66D",fontFamily:"'Fredoka One'",fontSize:16}}>{coins}</span>
+            </div>
           </div>
         </div>
         {streakCount>=3&&feedback==="correct"&&<div style={{textAlign:"center",color:"#FFE66D",fontFamily:"'Fredoka One'",fontSize:16,animation:"pop 0.3s ease-out"}}>🔥 {streakCount} in a row!</div>}
         <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",padding:"11px 13px"}}>
-          <div style={{background:"rgba(255,255,255,0.06)",border:`2px solid ${activeUnit.color}30`,borderRadius:19,padding:"20px 17px",width:"100%",maxWidth:420,textAlign:"center",marginBottom:14,animation:"pop 0.3s ease-out"}}>
+          <div style={{background:"rgba(255,255,255,0.06)",border:`2px solid ${tierColor}30`,borderRadius:19,padding:"20px 17px",width:"100%",maxWidth:420,textAlign:"center",marginBottom:14,animation:"pop 0.3s ease-out"}}>
             <div style={{color:"rgba(255,255,255,0.25)",fontSize:10,fontWeight:800,letterSpacing:1,marginBottom:7}}>{activeSubject?.label.toUpperCase()} · Q{qIndex+1} OF {TOTAL_Q}</div>
             <div style={{color:"white",fontFamily:"'Fredoka One'",fontSize:q.text?.length>70?16:q.text?.length>40?20:26,lineHeight:1.4}}>{q.text}</div>
           </div>
@@ -763,8 +914,8 @@ export default function Clariva() {
               );
             })}
           </div>
-          {feedback==="correct"&&<div style={{marginTop:12,color:"#4ECDC4",fontFamily:"'Fredoka One'",fontSize:19,animation:"pop 0.3s ease-out"}}>🎉 Correct! Amazing!</div>}
-          {feedback==="wrong"&&!showTutor&&<div style={{marginTop:12,color:"#FFE66D",fontFamily:"'Fredoka One'",fontSize:15,animation:"pop 0.3s ease-out"}}>🦉 Calling Max to help...</div>}
+          {feedback==="correct"&&<div style={{marginTop:12,color:"#4ECDC4",fontFamily:"'Fredoka One'",fontSize:19,animation:"pop 0.3s ease-out"}}>Correct! Well done!</div>}
+          {feedback==="wrong"&&!showTutor&&<div style={{marginTop:12,color:"#FFE66D",fontFamily:"'Fredoka One'",fontSize:15,animation:"pop 0.3s ease-out"}}>Max is reviewing this with you...</div>}
         </div>
       </div>
     );
@@ -772,26 +923,31 @@ export default function Clariva() {
 
   // ── RESULT ──
   if(screen==="result"){
-    const pct=Math.round((score/TOTAL_Q)*100);
+    const pct=lastPct;
     const stars=pct>=STAR_T[2]?3:pct>=STAR_T[1]?2:pct>=STAR_T[0]?1:0;
-    const mi=pct>=90?3:pct>=75?2:pct>=60?1:0;
-    const msgs=["💪 Keep going! Max is here!","👍 Good job! Practice makes perfect!","🎉 Great work! You're on fire!","🏆 Legendary! You crushed it!"];
-    const isBeyond=activeUnit?.beyondGrade;
+    const diff=difficulty(activeLevel);
+    const allLevels=activeUnit?getLevelsFor(activeUnit):[];
     return(
       <div style={{minHeight:"100vh",background:"linear-gradient(160deg,#0f0c29,#302b63,#24243e)",fontFamily:"'Nunito',sans-serif",display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
         <style>{CSS}</style>
-        <div style={{background:"rgba(255,255,255,0.06)",border:`2px solid ${activeUnit.color}30`,borderRadius:24,padding:"26px 20px",width:"100%",maxWidth:350,textAlign:"center",animation:"pop 0.4s ease-out"}}>
-          {isBeyond&&<div style={{background:"rgba(255,230,109,0.15)",border:"1px solid rgba(255,230,109,0.3)",borderRadius:18,padding:"3px 11px",display:"inline-block",marginBottom:9}}><span style={{color:"#FFE66D",fontSize:11,fontWeight:800}}>🚀 Grade {Number(grade)+1} Content!</span></div>}
-          <div style={{fontSize:46,marginBottom:9}}>{["💪","👍","🎉","🏆"][mi]}</div>
-          <div style={{color:"white",fontFamily:"'Fredoka One'",fontSize:18,marginBottom:5}}>{msgs[mi]}</div>
+        {showCoinModal&&<CoinModal coins={lastCoins} pct={pct} levelLabel={`Level ${activeLevel+1} · ${diff.label}`} tier={diff.tier} onClose={()=>setShowCoinModal(false)}/>}
+        <div style={{background:"rgba(255,255,255,0.06)",border:`2px solid ${activeUnit.color}30`,borderRadius:24,padding:"24px 20px",width:"100%",maxWidth:350,textAlign:"center",animation:"pop 0.4s ease-out"}}>
+          <div style={{color:"rgba(255,255,255,0.35)",fontSize:11,marginBottom:6}}>Level {activeLevel+1} · {diff.label}</div>
           <div style={{fontFamily:"'Fredoka One'",fontSize:54,marginBottom:4,background:`linear-gradient(90deg,${activeUnit.color},white,${activeUnit.color})`,backgroundSize:"200% auto",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",animation:"shimmer 2s linear infinite"}}>{pct}%</div>
-          <div style={{color:"rgba(255,255,255,0.4)",fontSize:13,marginBottom:13}}>{score} / {TOTAL_Q} correct</div>
-          <div style={{display:"flex",justifyContent:"center",gap:5,marginBottom:18}}>
-            {[1,2,3].map(i=><span key={i} style={{fontSize:26,filter:i<=stars?"none":"grayscale(1) opacity(0.2)",animation:i<=stars?`pop ${0.15+i*0.1}s ease-out both`:"none"}}>⭐</span>)}
+          <div style={{color:"rgba(255,255,255,0.4)",fontSize:13,marginBottom:10}}>{score} / {TOTAL_Q} correct</div>
+          <div style={{display:"flex",justifyContent:"center",gap:5,marginBottom:14}}>
+            {[1,2,3].map(i=><span key={i} style={{fontSize:24,filter:i<=stars?"none":"grayscale(1) opacity(0.2)",animation:i<=stars?`pop ${0.15+i*0.1}s ease-out both`:"none"}}>⭐</span>)}
+          </div>
+          <div style={{background:"rgba(255,230,109,0.1)",border:"1px solid rgba(255,230,109,0.25)",borderRadius:12,padding:"10px",marginBottom:16,display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+            <span style={{fontSize:22}}>🪙</span>
+            <div>
+              <div style={{color:"#FFE66D",fontFamily:"'Fredoka One'",fontSize:20}}>+{lastCoins} coins</div>
+              <div style={{color:"rgba(255,255,255,0.4)",fontSize:11}}>Total: {coins} coins</div>
+            </div>
           </div>
           <div style={{display:"flex",flexDirection:"column",gap:8}}>
             <button className="btn-hover" onClick={()=>startQuiz(activeUnit,activeLevel)} style={{background:activeUnit.color,border:"none",borderRadius:12,padding:12,color:"#1a1a2e",fontFamily:"'Fredoka One'",fontSize:15,boxShadow:`0 4px 12px ${activeUnit.color}44`}}>🔄 Try Again</button>
-            {activeLevel<activeUnit.levels.length-1&&stars>=1&&<button className="btn-hover" onClick={()=>startQuiz(activeUnit,activeLevel+1)} style={{background:"rgba(255,255,255,0.08)",border:`1.5px solid ${activeUnit.color}40`,borderRadius:12,padding:12,color:"white",fontFamily:"'Fredoka One'",fontSize:15}}>⬆️ Next Level</button>}
+            {activeLevel<allLevels.length-1&&stars>=1&&<button className="btn-hover" onClick={()=>startQuiz(activeUnit,activeLevel+1)} style={{background:"rgba(255,255,255,0.08)",border:`1.5px solid ${activeUnit.color}40`,borderRadius:12,padding:12,color:"white",fontFamily:"'Fredoka One'",fontSize:15}}>⬆️ Next Level</button>}
             <button className="btn-hover" onClick={()=>setScreen("units")} style={{background:"rgba(255,255,255,0.06)",border:"1.5px solid rgba(255,255,255,0.1)",borderRadius:12,padding:12,color:"rgba(255,255,255,0.5)",fontFamily:"'Fredoka One'",fontSize:15}}>📚 More Units</button>
             <button className="btn-hover" onClick={()=>setScreen("subjects")} style={{background:"transparent",border:"1.5px solid rgba(255,255,255,0.07)",borderRadius:12,padding:12,color:"rgba(255,255,255,0.3)",fontFamily:"'Fredoka One'",fontSize:15}}>🏠 All Subjects</button>
           </div>
