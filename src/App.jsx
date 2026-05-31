@@ -176,20 +176,6 @@ function generateQuestion(subject, unit, levelIdx) {
   return q;
 }
 
-function getSteps(q, subject) {
-  if(subject!=="math") return [`Question: "${q.text}"`,`The correct answer is: "${q.answer}"`,`Think about what you know about this topic!`,`Review this and try again — you'll get it! ✅`];
-  const {op,a,b,answer,n,to}=q;
-  switch(op){
-    case "mul": return [`We need ${a} × ${b}.`,`Think: ${a} groups with ${b} in each.`,`${Array.from({length:Math.min(a,6)},(_,i)=>`Group ${i+1}: ${b}`).join(" · ")}${a>6?" · ...":""}`,`✅ ${a} × ${b} = ${answer}`];
-    case "div": return [`We need ${a} ÷ ${b}.`,`"How many groups of ${b} fit in ${a}?"`,`Count by ${b}s: ${Array.from({length:Math.min(answer,8)},(_,i)=>(i+1)*b).join(", ")}`,`✅ ${a} ÷ ${b} = ${answer}`];
-    case "add": return [`Add ${a} + ${b}.`,`Start with ${Math.max(a,b)}, count up ${Math.min(a,b)}.`,`${a} + ${b} = ${answer}`,`✅ Answer: ${answer}`];
-    case "sub": return [`Subtract: ${a} − ${b}.`,`Start at ${a}, count back ${b}.`,`Or think: ${b} + ? = ${a}`,`✅ Answer: ${answer}`];
-    case "round": return [`Round ${n} to the nearest ${to}.`,`Multiples of ${to} near ${n}: ${Math.floor(n/to)*to} and ${Math.floor(n/to)*to+to}.`,`${n} is closer to ${answer}.`,`✅ ${n} → ${answer}`];
-    case "missing": return [`${a} × ? = ${b}`,`Same as ${b} ÷ ${a}.`,`${b} ÷ ${a} = ${answer}`,`✅ Missing factor: ${answer}`];
-    case "place": return [`${a} tens = ${a*10}. Plus ${b} ones = ${b}.`,`${a*10} + ${b} = ${answer}`,`✅ Answer: ${answer}`];
-    default: return [`The correct answer is "${answer}".`,`Review this concept!`,`✅ You've got this!`];
-  }
-}
 
 // ─── LEVEL SYSTEM ─────────────────────────────────────────────────────────────
 // Each unit has 10 levels:
