@@ -226,8 +226,8 @@ function calcCoins(pct, tierOrLevelIdx) {
 //   "VR6AewLTigWG4xSOukaG" = Arnold (confident American male)
 //   "pNInz6obpgDQGcFmaJgB" = Adam   (deep, clear American male)
 //   "onwK4e9ZLuTAKqWW03F9" = Daniel (warm British educator — RECOMMENDED)
-const ELEVENLABS_API_KEY  = "";  // ← paste your key here
-const ELEVENLABS_VOICE_ID = "onwK4e9ZLuTAKqWW03F9"; // Daniel — warm educator
+const ELEVENLABS_API_KEY  = "sk_52217fa317bd1124530d2dbc4772477ea4d896777c30fc0c"
+const ELEVENLABS_VOICE_ID = "onwK4e9ZLuTAKqWW03F9"; // Will — warm educator
 const ELEVENLABS_MODEL    = "eleven_flash_v2_5";
 
 let _activeAudio = null;
