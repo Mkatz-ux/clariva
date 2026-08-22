@@ -99,22 +99,28 @@ function getUnits(subject, grade) {
 }
 
 // ─── QUESTION GENERATORS ──────────────────────────────────────────────────────
+// Levels 0-4 stay exactly at the LVUSD grade-level standard (unscaled).
+// Levels 5-7 ("Challenge I/II/III") and 8-9 ("Beyond Grade") scale numbers up
+// using the difficulty() multiplier so they're a real step up, not a relabel.
 function genMath(unit, levelIdx) {
-  const level = unit.levels[levelIdx];
+  const level = unit.levels[levelIdx] || unit.levels[unit.levels.length-1] || {};
+  const tier = difficulty(levelIdx).tier;
+  const scale = tier==="grade" ? 1 : difficulty(levelIdx).mult;
+  const cap = (base, mx) => Math.min(mx, Math.round(base*scale));
   switch(unit.id) {
-    case "add_sub_20": { const max=20; const isAdd=levelIdx%2===0; const a=Math.floor(Math.random()*(max*0.7))+1,b=Math.floor(Math.random()*(max*0.3))+1; return isAdd?{text:`${a} + ${b} = ?`,answer:a+b,a,b,op:"add"}:{text:`${a+b} − ${b} = ?`,answer:a,a:a+b,b,op:"sub"}; }
-    case "add_sub_100":{ const max=100;const isAdd=levelIdx<2||levelIdx===4&&Math.random()>.5;const a=Math.floor(Math.random()*60)+1,b=Math.floor(Math.random()*35)+1;return isAdd?{text:`${a} + ${b} = ?`,answer:a+b,a,b,op:"add"}:{text:`${a+b} − ${b} = ?`,answer:a,a:a+b,b,op:"sub"};}
-    case "add_sub_1000":{const isAdd=levelIdx<2||levelIdx===4&&Math.random()>.5;const a=Math.floor(Math.random()*500)+50,b=Math.floor(Math.random()*300)+50;return isAdd?{text:`${a} + ${b} = ?`,answer:a+b,a,b,op:"add"}:{text:`${a+b} − ${b} = ?`,answer:a,a:a+b,b,op:"sub"};}
-    case "place_val_1":case "place_val_2":{ const n=Math.floor(Math.random()*90)+10; return {text:`${Math.floor(n/10)} tens + ${n%10} ones = ?`,answer:n,a:Math.floor(n/10),b:n%10,op:"place"};}
-    case "multiplication":{ const factors=level.factors||[1,2,3,4,5,6,7,8,9,10]; const a=factors[Math.floor(Math.random()*factors.length)],b=Math.floor(Math.random()*10)+1; return {text:`${a} × ${b} = ?`,answer:a*b,a,b,op:"mul"};}
-    case "division":{ const divisors=level.divisors||[2,3,4,5,6,7,8,9]; const d=divisors[Math.floor(Math.random()*divisors.length)],q=Math.floor(Math.random()*10)+1; return {text:`${d*q} ÷ ${d} = ?`,answer:q,a:d*q,b:d,op:"div"};}
-    case "mul_div_rel":{ const pool=[2,3,4,5,6,7,8,9];const d=pool[Math.floor(Math.random()*pool.length)],q=Math.floor(Math.random()*9)+2; return Math.random()>.5?{text:`${d} × ? = ${d*q}`,answer:q,a:d,b:d*q,op:"missing"}:{text:`${d*q} ÷ ${d} = ?`,answer:q,a:d*q,b:d,op:"div"};}
-    case "rounding":{ const n=Math.floor(Math.random()*950)+50,to=levelIdx<=1?10:levelIdx===2?100:Math.random()>.5?100:10; return {text:`Round ${n} to the nearest ${to}.`,answer:Math.round(n/to)*to,n,to,op:"round"};}
-    case "fractions_3":case "fractions_4":case "fractions_5":{ const denoms=level.denoms||[2,3,4,6,8];const d=denoms[Math.floor(Math.random()*denoms.length)],n=Math.floor(Math.random()*(d-1))+1; return {text:`Which shows ${n} out of ${d} equal parts?`,answer:`${n}/${d}`,choices:[`${n}/${d}`,`${Math.min(n+1,d-1)}/${d}`,`${n}/${d+1}`,`${Math.max(1,n-1)}/${d}`],op:"frac"};}
-    case "mul_div_4":{ if(levelIdx===0){const a=Math.floor(Math.random()*9)+1,b=[10,100][Math.floor(Math.random()*2)];return {text:`${a} × ${b} = ?`,answer:a*b,a,b,op:"mul"};}const a=Math.floor(Math.random()*9)+1,b=Math.floor(Math.random()*99)+10;return {text:`${b} × ${a} = ?`,answer:b*a,a:b,b:a,op:"mul"};}
-    case "decimals_4":case "decimals_5":{ const a=(Math.floor(Math.random()*90)+1)/10,b=(Math.floor(Math.random()*90)+1)/10;return {text:`${a.toFixed(1)} + ${b.toFixed(1)} = ?`,answer:parseFloat((a+b).toFixed(1)),a,b,op:"add"};}
-    case "word_prob_3":{ const a=Math.floor(Math.random()*20)+3,b=Math.floor(Math.random()*12)+2;const pool=[{text:`Sam has ${a} 🍎 and gets ${b} more. Total?`,answer:a+b,op:"word_add"},{text:`${a} kids each get ${b} ⭐. Total stickers?`,answer:a*b,op:"word_mul"},{text:`${a*b} 🍇 split into ${a} bags equally. Each bag?`,answer:b,op:"word_div"},{text:`${a+b} birds 🐦. ${b} flew away. How many left?`,answer:a,op:"word_sub"}];return pool[Math.floor(Math.random()*pool.length)];}
-    default:{ const a=Math.floor(Math.random()*50)+1,b=Math.floor(Math.random()*50)+1;return {text:`${a} + ${b} = ?`,answer:a+b,a,b,op:"add"};}
+    case "add_sub_20": { const max=cap(20,300); const isAdd=levelIdx%2===0; const a=Math.floor(Math.random()*(max*0.7))+1,b=Math.floor(Math.random()*(max*0.3))+1; return isAdd?{text:`${a} + ${b} = ?`,answer:a+b,a,b,op:"add"}:{text:`${a+b} − ${b} = ?`,answer:a,a:a+b,b,op:"sub"}; }
+    case "add_sub_100":{ const isAdd=levelIdx<2||levelIdx===4&&Math.random()>.5;const a=Math.floor(Math.random()*cap(60,600))+1,b=Math.floor(Math.random()*cap(35,400))+1;return isAdd?{text:`${a} + ${b} = ?`,answer:a+b,a,b,op:"add"}:{text:`${a+b} − ${b} = ?`,answer:a,a:a+b,b,op:"sub"};}
+    case "add_sub_1000":{const isAdd=levelIdx<2||levelIdx===4&&Math.random()>.5;const a=Math.floor(Math.random()*cap(500,4000))+50,b=Math.floor(Math.random()*cap(300,2500))+50;return isAdd?{text:`${a} + ${b} = ?`,answer:a+b,a,b,op:"add"}:{text:`${a+b} − ${b} = ?`,answer:a,a:a+b,b,op:"sub"};}
+    case "place_val_1":case "place_val_2":{ const n=Math.floor(Math.random()*cap(90,900))+10; return {text:`${Math.floor(n/10)} tens + ${n%10} ones = ?`,answer:n,a:Math.floor(n/10),b:n%10,op:"place"};}
+    case "multiplication":{ let factors=level.factors||[1,2,3,4,5,6,7,8,9,10]; if(tier!=="grade") factors=[...new Set([...factors,9,10,11,12])]; const a=factors[Math.floor(Math.random()*factors.length)],b=Math.floor(Math.random()*cap(10,40))+1; return {text:`${a} × ${b} = ?`,answer:a*b,a,b,op:"mul"};}
+    case "division":{ let divisors=level.divisors||[2,3,4,5,6,7,8,9]; if(tier!=="grade") divisors=[...new Set([...divisors,9,10,11,12])]; const d=divisors[Math.floor(Math.random()*divisors.length)],q=Math.floor(Math.random()*cap(10,40))+1; return {text:`${d*q} ÷ ${d} = ?`,answer:q,a:d*q,b:d,op:"div"};}
+    case "mul_div_rel":{ let pool=[2,3,4,5,6,7,8,9]; if(tier!=="grade") pool=[...pool,10,11,12];const d=pool[Math.floor(Math.random()*pool.length)],q=Math.floor(Math.random()*cap(9,30))+2; return Math.random()>.5?{text:`${d} × ? = ${d*q}`,answer:q,a:d,b:d*q,op:"missing"}:{text:`${d*q} ÷ ${d} = ?`,answer:q,a:d*q,b:d,op:"div"};}
+    case "rounding":{ const n=Math.floor(Math.random()*cap(950,9500))+50; let to; if(tier==="beyond") to=1000; else if(tier==="extended") to=Math.random()>.5?100:1000; else to=levelIdx<=1?10:levelIdx===2?100:Math.random()>.5?100:10; return {text:`Round ${n} to the nearest ${to}.`,answer:Math.round(n/to)*to,n,to,op:"round"};}
+    case "fractions_3":case "fractions_4":case "fractions_5":{ let denoms=level.denoms||[2,3,4,6,8]; if(tier==="extended") denoms=[...new Set([...denoms,10,12])]; if(tier==="beyond") denoms=[10,12,16,20]; const d=denoms[Math.floor(Math.random()*denoms.length)],n=Math.floor(Math.random()*(d-1))+1; return {text:`Which shows ${n} out of ${d} equal parts?`,answer:`${n}/${d}`,choices:[`${n}/${d}`,`${Math.min(n+1,d-1)}/${d}`,`${n}/${d+1}`,`${Math.max(1,n-1)}/${d}`],op:"frac"};}
+    case "mul_div_4":{ if(levelIdx===0){const a=Math.floor(Math.random()*9)+1,b=[10,100][Math.floor(Math.random()*2)];return {text:`${a} × ${b} = ?`,answer:a*b,a,b,op:"mul"};}const a=Math.floor(Math.random()*9)+1,b=Math.floor(Math.random()*cap(99,400))+10;return {text:`${b} × ${a} = ?`,answer:b*a,a:b,b:a,op:"mul"};}
+    case "decimals_4":case "decimals_5":{ const places=tier==="grade"?1:2; const div=places===1?10:100; const wholeMax=cap(90,8000); const a=(Math.floor(Math.random()*wholeMax)+1)/div,b=(Math.floor(Math.random()*wholeMax)+1)/div;return {text:`${a.toFixed(places)} + ${b.toFixed(places)} = ?`,answer:parseFloat((a+b).toFixed(places)),a,b,op:"add"};}
+    case "word_prob_3":{ const a=Math.floor(Math.random()*cap(20,150))+3,b=Math.floor(Math.random()*cap(12,80))+2;const pool=[{text:`Sam has ${a} 🍎 and gets ${b} more. Total?`,answer:a+b,op:"word_add"},{text:`${a} kids each get ${b} ⭐. Total stickers?`,answer:a*b,op:"word_mul"},{text:`${a*b} 🍇 split into ${a} bags equally. Each bag?`,answer:b,op:"word_div"},{text:`${a+b} birds 🐦. ${b} flew away. How many left?`,answer:a,op:"word_sub"}];return pool[Math.floor(Math.random()*pool.length)];}
+    default:{ const a=Math.floor(Math.random()*cap(50,500))+1,b=Math.floor(Math.random()*cap(50,500))+1;return {text:`${a} + ${b} = ?`,answer:a+b,a,b,op:"add"};}
   }
 }
 
