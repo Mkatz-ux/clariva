@@ -615,8 +615,15 @@ export default function Clariva() {
   }
 
   const startQuiz=(unit,levelIdx)=>{
+    // Avoid showing the exact same question text back-to-back (or repeatedly) within
+    // one quiz — small curated question banks were otherwise landing the same
+    // question 2-3x in a row purely by chance.
+    const seen=new Set();
     const qs=Array.from({length:TOTAL_Q},()=>{
-      const q=generateQuestion(activeSubject.id,unit,levelIdx);
+      let q,tries=0;
+      do{ q=generateQuestion(activeSubject.id,unit,levelIdx); tries++; }
+      while(seen.has(q.text)&&tries<25);
+      seen.add(q.text);
       return q;
     });
     setQuestions(qs);setQIndex(0);setScore(0);setSelected(null);setFeedback(null);
