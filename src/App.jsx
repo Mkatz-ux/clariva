@@ -116,7 +116,20 @@ function genMath(unit, levelIdx) {
     case "division":{ let divisors=level.divisors||[2,3,4,5,6,7,8,9]; if(tier!=="grade") divisors=[...new Set([...divisors,9,10,11,12])]; const d=divisors[Math.floor(Math.random()*divisors.length)],q=Math.floor(Math.random()*cap(10,40))+1; return {text:`${d*q} ÷ ${d} = ?`,answer:q,a:d*q,b:d,op:"div"};}
     case "mul_div_rel":{ let pool=[2,3,4,5,6,7,8,9]; if(tier!=="grade") pool=[...pool,10,11,12];const d=pool[Math.floor(Math.random()*pool.length)],q=Math.floor(Math.random()*cap(9,30))+2; return Math.random()>.5?{text:`${d} × ? = ${d*q}`,answer:q,a:d,b:d*q,op:"missing"}:{text:`${d*q} ÷ ${d} = ?`,answer:q,a:d*q,b:d,op:"div"};}
     case "rounding":{ const n=Math.floor(Math.random()*cap(950,9500))+50; let to; if(tier==="beyond") to=1000; else if(tier==="extended") to=Math.random()>.5?100:1000; else to=levelIdx<=1?10:levelIdx===2?100:Math.random()>.5?100:10; return {text:`Round ${n} to the nearest ${to}.`,answer:Math.round(n/to)*to,n,to,op:"round"};}
-    case "fractions_3":case "fractions_4":case "fractions_5":{ let denoms=level.denoms||[2,3,4,6,8]; if(tier==="extended") denoms=[...new Set([...denoms,10,12])]; if(tier==="beyond") denoms=[10,12,16,20]; const d=denoms[Math.floor(Math.random()*denoms.length)],n=Math.floor(Math.random()*(d-1))+1; return {text:`Which shows ${n} out of ${d} equal parts?`,answer:`${n}/${d}`,choices:[`${n}/${d}`,`${Math.min(n+1,d-1)}/${d}`,`${n}/${d+1}`,`${Math.max(1,n-1)}/${d}`],op:"frac"};}
+    case "fractions_3":case "fractions_4":case "fractions_5":{
+      let denoms=level.denoms||[2,3,4,6,8]; if(tier==="extended") denoms=[...new Set([...denoms,10,12])]; if(tier==="beyond") denoms=[10,12,16,20];
+      const d=denoms[Math.floor(Math.random()*denoms.length)],n=Math.floor(Math.random()*(d-1))+1;
+      const answer=`${n}/${d}`;
+      const distractors=new Set();
+      const deltas=[1,-1,2,-2,3,-3,4,-4,5,-5];
+      for(let i=0;i<deltas.length&&distractors.size<3;i++){
+        const cn=n+deltas[i];
+        if(cn>=1&&cn<=d-1){const cand=`${cn}/${d}`; if(cand!==answer) distractors.add(cand);}
+      }
+      let dd=1;
+      while(distractors.size<3){ const cand=`${n}/${d+dd}`; if(cand!==answer) distractors.add(cand); dd++; }
+      return {text:`Which shows ${n} out of ${d} equal parts?`,answer,choices:[answer,...distractors].sort(()=>Math.random()-0.5),op:"frac"};
+    }
     case "mul_div_4":{ if(levelIdx===0){const a=Math.floor(Math.random()*9)+1,b=[10,100][Math.floor(Math.random()*2)];return {text:`${a} × ${b} = ?`,answer:a*b,a,b,op:"mul"};}const a=Math.floor(Math.random()*9)+1,b=Math.floor(Math.random()*cap(99,400))+10;return {text:`${b} × ${a} = ?`,answer:b*a,a:b,b:a,op:"mul"};}
     case "decimals_4":case "decimals_5":{ const places=tier==="grade"?1:2; const div=places===1?10:100; const wholeMax=cap(90,8000); const a=(Math.floor(Math.random()*wholeMax)+1)/div,b=(Math.floor(Math.random()*wholeMax)+1)/div;return {text:`${a.toFixed(places)} + ${b.toFixed(places)} = ?`,answer:parseFloat((a+b).toFixed(places)),a,b,op:"add"};}
     case "word_prob_3":{ const a=Math.floor(Math.random()*cap(20,150))+3,b=Math.floor(Math.random()*cap(12,80))+2;const pool=[{text:`Sam has ${a} 🍎 and gets ${b} more. Total?`,answer:a+b,op:"word_add"},{text:`${a} kids each get ${b} ⭐. Total stickers?`,answer:a*b,op:"word_mul"},{text:`${a*b} 🍇 split into ${a} bags equally. Each bag?`,answer:b,op:"word_div"},{text:`${a+b} birds 🐦. ${b} flew away. How many left?`,answer:a,op:"word_sub"}];return pool[Math.floor(Math.random()*pool.length)];}
